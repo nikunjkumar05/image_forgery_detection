@@ -1,0 +1,10 @@
+tensorflow>=2.10,<2.16
+numpy
+Pillow
+tqdm
+streamlit>=1.28
+scikit-image
+scikit-learn
+opencv-python
+matplotlib
+seaborn

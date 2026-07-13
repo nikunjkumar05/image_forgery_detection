@@ -1,0 +1,20 @@
+# Dataset (too large for git)
+dataset/
+
+# Precomputed cache (auto-generated)
+cache/
+
+# Model checkpoints
+*.keras
+*.h5
+*.hdf5
+
+# Colab / IDE artifacts
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
