@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Forgery Detection: Image Forgery Detection</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Image Forgery Detection</h1>
+            <p class="subtitle">Lightweight Multi-Spectral Forgery Detection</p>
+        </header>
+
+        <main>
+            <div class="upload-section" id="drop-zone">
+                <input type="file" id="file-input" accept="image/jpeg, image/png, image/webp" multiple hidden>
+                <div class="upload-content">
+                    <svg class="upload-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path>
+                    </svg>
+                    <p>Drag & Drop an image here or <span class="browse-link">Browse</span></p>
+                    <p class="small-text">Supports JPG, PNG, WEBP</p>
+                </div>
+            </div>
+
+            <div class="loading-state hidden" id="loading-state">
+                <div class="spinner"></div>
+                <p>Analyzing Multi-Spectral Frequencies...</p>
+            </div>
+
+            <div id="results-container" class="hidden">
+                <div class="results-grid" id="results-grid">
+                    <!-- Dynamic result cards will be injected here -->
+                </div>
+                <button class="btn-reset" id="btn-reset">Scan More Images</button>
+            </div>
+        </main>
+        
+        <footer>
+            <p>Powered by Dual DenseNet121 & Bidirectional Cross-Attention</p>
+        </footer>
+    </div>
+    <script src="/static/script.js"></script>
+</body>
+</html>

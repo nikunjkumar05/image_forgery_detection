@@ -1,0 +1,59 @@
+{
+  "accuracy": 0.8966,
+  "auc": 0.9279,
+  "f1_tampered": 0.892,
+  "f1_authentic": 0.9008,
+  "precision": 0.961,
+  "recall": 0.8322,
+  "tampered_acc": 0.8322,
+  "authentic_acc": 0.9644,
+  "ablation": {
+    "RAW only": 0.5235,
+    "+ ELA stream": 0.841,
+    "Swapped streams": 0.5095,
+    "Full Model": 0.8675
+  },
+  "robustness": {
+    "Original": 0.8966,
+    "JPEG Q=75": 0.831,
+    "JPEG Q=50": 0.801,
+    "JPEG Q=25": 0.763,
+    "Gauss. Noise": 0.818,
+    "Gauss. Blur": 0.824,
+    "Brightness \u00b130%": 0.841
+  },
+  "per_class": {
+    "splicing": 0.8322,
+    "copy_move": 0.7323,
+    "authentic": 0.9644
+  },
+  "casia_finetuned": {
+    "accuracy": 0.9073,
+    "auc": 0.9722,
+    "f1": 0.9056,
+    "precision": 0.9661,
+    "recall": 0.8745,
+    "eer": 0.0976,
+    "test_samples": 2523,
+    "optimal_threshold": 0.65,
+    "confusion_matrix": [
+      [
+        979,
+        46
+      ],
+      [
+        188,
+        1310
+      ]
+    ]
+  },
+  "defacto_primary": {
+    "accuracy": 0.8845,
+    "auc": 0.9228,
+    "loss": 0.4401,
+    "parameters": "25.2M",
+    "forma_parameters": "37.0M",
+    "target_acc": 0.847,
+    "target_auc": 0.89
+  }
+}

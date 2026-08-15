@@ -1,368 +1,191 @@
-import streamlit as st
-import tensorflow as tf
-import numpy as np
-from PIL import Image, ImageChops, ExifTags
-import json
-import tempfile
 import os
-from io import BytesIO
-import matplotlib.cm as cm
+import io
+import base64
+import numpy as np
+from PIL import Image, ImageChops
+import tensorflow as tf
+from tensorflow.keras import layers
+from typing import List
+from fastapi import FastAPI, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse
+import uvicorn
 
-# optional EfficientNet preprocess
+app = FastAPI()
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/")
+def read_root():
+    return FileResponse("static/index.html")
+
+# Custom Classes required by the model
+class CrossAttentionFusion(layers.Layer):
+    def __init__(self, embed_dim=256, num_heads=4, **kwargs):
+        super(CrossAttentionFusion, self).__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+    def build(self, input_shape):
+        dim = input_shape[0][-1]
+        self.Wq_r = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wq_r')
+        self.Wk_e = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wk_e')
+        self.Wv_e = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wv_e')
+        self.Wq_e = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wq_e')
+        self.Wk_r = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wk_r')
+        self.Wv_r = self.add_weight(shape=(dim, self.embed_dim), initializer='glorot_uniform', name='Wv_r')
+        self.Wo = self.add_weight(shape=(self.embed_dim * 2, self.embed_dim), initializer='glorot_uniform', name='Wo')
+        self.bias = self.add_weight(shape=(self.embed_dim,), initializer='zeros', name='bias')
+
+    def _scaled_dot_product(self, Q, K, V):
+        scale = tf.math.sqrt(tf.cast(self.head_dim, Q.dtype))
+        scores = tf.matmul(Q, K, transpose_b=True) / scale
+        weights = tf.nn.softmax(scores, axis=-1)
+        return tf.matmul(weights, V)
+
+    def call(self, inputs):
+        raw_feat, ela_feat = inputs
+        Q_r = tf.matmul(raw_feat, self.Wq_r)
+        K_e = tf.matmul(ela_feat, self.Wk_e)
+        V_e = tf.matmul(ela_feat, self.Wv_e)
+        
+        Q_e = tf.matmul(ela_feat, self.Wq_e)
+        K_r = tf.matmul(raw_feat, self.Wk_r)
+        V_r = tf.matmul(raw_feat, self.Wv_r)
+        
+        attn_r2e = self._scaled_dot_product(Q_r, K_e, V_e)
+        attn_e2r = self._scaled_dot_product(Q_e, K_r, V_r)
+        
+        combined = tf.concat([attn_r2e, attn_e2r], axis=-1)
+        output = tf.matmul(combined, self.Wo) + self.bias
+        return output
+
+class OHEMFocalLoss(tf.keras.losses.Loss):
+    def __init__(self, gamma=3.0, alpha=0.25, hard_ratio=0.20, **kwargs):
+        super(OHEMFocalLoss, self).__init__(**kwargs)
+        self.gamma = gamma
+        self.alpha = alpha
+        self.hard_ratio = hard_ratio
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        bce = tf.keras.backend.binary_crossentropy(y_true, y_pred)
+        p_t = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        alpha_factor = y_true * self.alpha + (1 - y_true) * (1 - self.alpha)
+        focal_loss = alpha_factor * tf.pow(1.0 - p_t, self.gamma) * bce
+        
+        bs = tf.shape(focal_loss)[0]
+        k = tf.cast(tf.math.ceil(tf.cast(bs, tf.float32) * self.hard_ratio), tf.int32)
+        top_k_loss, _ = tf.math.top_k(focal_loss, k=k)
+        return tf.reduce_mean(top_k_loss)
+
+# Load the model globally
+MODEL_PATH = "best_forgery_model_sota.keras"
+print("Loading model...")
 try:
-    from tensorflow.keras.applications.efficientnet import preprocess_input as ef_preprocess
-except Exception:
-    ef_preprocess = None
-
-# ---------------- PAGE CONFIG ----------------
-st.set_page_config(page_title="Forgery Detector", layout="centered")
-
-# ---------------- STYLING ----------------
-st.markdown("""
-<style>
-h1, h2, h3 {
-    color: white;
-}
-.stButton>button {
-    background: linear-gradient(90deg, #4CAF50, #2ecc71);
-    color: white;
-    border-radius: 10px;
-    height: 3em;
-    width: 100%;
-    font-size: 16px;
-}
-.stFileUploader {
-    border: 2px dashed #444;
-    padding: 10px;
-    border-radius: 10px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------- HEADER ----------------
-st.markdown("""
-<h1 style='text-align: center;'>🕵️ Image Forgery Detector</h1>
-<p style='text-align: center; color: gray;'>
-Detect whether an image is <b>Authentic</b> or <b>Tampered</b>
-</p>
-""", unsafe_allow_html=True)
-
-
-# ---------------- MODEL LOADER ----------------
-def _load_model(path):
-    """Load a Keras model from disk."""
-    return tf.keras.models.load_model(path, compile=False)
-
-if hasattr(st, "cache_resource"):
-    load_model_cached = st.cache_resource(_load_model)
-else:
-    load_model_cached = st.cache(allow_output_mutation=True)(_load_model)
-
-
-# ---------------- ELA ----------------
-def compute_ela(pil_img, quality=70, scale=1.0, resize_to=None):
-    """Compute Error Level Analysis image from a PIL image."""
-    buf = BytesIO()
-    pil_img.convert("RGB").save(buf, format="JPEG", quality=int(quality))
-    buf.seek(0)
-    compressed = Image.open(buf).convert("RGB")
-
-    ela = ImageChops.difference(pil_img.convert("RGB"), compressed)
-    ela_np = np.asarray(ela).astype(np.float32)
-
-    mx = ela_np.max() if ela_np.size else 0.0
-    if mx > 0:
-        ela_np = (ela_np * (255.0 / mx)) * float(scale)
-
-    ela_np = np.clip(ela_np, 0, 255).astype(np.uint8)
-    ela_img = Image.fromarray(ela_np)
-
-    if resize_to:
-        ela_img = ela_img.resize(resize_to, Image.LANCZOS)
-
-    return ela_img
-
-
-# ---------------- PREPROCESS ----------------
-def preprocess_pil(img_pil, target_size=(224, 224), use_efficientnet=False):
-    """Resize and normalize a PIL image for model input."""
-    img = img_pil.convert("RGB").resize(target_size, Image.LANCZOS)
-    arr = np.asarray(img).astype("float32")
-
-    if use_efficientnet and ef_preprocess is not None:
-        arr = ef_preprocess(arr)
-    else:
-        arr = arr / 255.0
-
-    return arr
-
-
-def infer_input_shapes(model):
-    """Infer expected input shapes from a loaded Keras model."""
-    try:
-        inputs = model.inputs
-        if not isinstance(inputs, (list, tuple)):
-            inputs = [inputs]
-
-        shapes = []
-        for inp in inputs:
-            s = inp.shape.as_list()
-            h = s[1] if s[1] else 224
-            w = s[2] if s[2] else 224
-            shapes.append((int(h), int(w)))
-
-        return shapes
-    except Exception:
-        return [(224, 224)]
-
-
-def load_threshold(uploaded, path):
-    """Load decision threshold from uploaded JSON or file path.
-
-    Returns the threshold value or None if not found.
-    """
-    try:
-        if uploaded:
-            data = json.loads(uploaded.getvalue())
-        elif path and os.path.isfile(path):
-            with open(path) as f:
-                data = json.load(f)
-        else:
-            return None
-
-        for k in ("threshold_authentic", "thr", "threshold", "best_threshold"):
-            if k in data:
-                return float(data[k])
-
-    except Exception:
-        return None
-
-
-def extract_prob(preds):
-    """Extract the authentic-class probability from model predictions.
-
-    For 2-output models: index 1 = authentic (authentic=1, tampered=0).
-    For 1-output sigmoid models: the value is p_authentic directly.
-    """
-    preds = np.asarray(preds)
-
-    if preds.ndim == 2 and preds.shape[1] == 2:
-        return float(preds[0, 1])
-    elif preds.ndim == 2 and preds.shape[1] == 1:
-        return float(preds[0, 0])
-    else:
-        return float(preds.flatten()[0])
-
-
-def generate_heatmap_overlay(pil_img, ela_img):
-    """Generate a heatmap overlay from the ELA image to highlight tampered regions."""
-    ela_np = np.asarray(ela_img).astype(np.float32)
-    gray = np.mean(ela_np, axis=2)
-    norm = gray / (gray.max() + 1e-8)
-    heatmap = cm.jet(norm)[:, :, :3]
-    heatmap = (heatmap * 255).astype(np.uint8)
-    heatmap_img = Image.fromarray(heatmap).resize(pil_img.size, Image.LANCZOS)
-
-    blended = Image.blend(pil_img.convert("RGB"), heatmap_img, alpha=0.45)
-    return blended
-
-
-def get_exif_tags(pil_img):
-    """Extract EXIF metadata from a PIL image as a dict."""
-    info = {}
-    try:
-        exif_data = pil_img.getexif()
-        if exif_data:
-            for tag_id, value in exif_data.items():
-                tag_name = ExifTags.TAGS.get(tag_id, str(tag_id))
-                info[tag_name] = str(value)[:200]  # truncate long values
-    except Exception:
-        pass
-    return info
-
-
-# ---------------- UI ----------------
-st.subheader("⚙️ Model Configuration")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    model_file = st.file_uploader("Upload Model (.keras/.h5)", type=["keras", "h5"])
-
-with col2:
-    model_path = st.text_input("Model Path", value="best_forgery_model.keras")
-
-threshold_file = st.file_uploader("Threshold JSON", type=["json"])
-threshold_path = st.text_input("Threshold Path", value="best_threshold.json")
-
-st.subheader("🧠 Prediction Settings")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    input_hint = st.selectbox("Input Mode",
-        ["Auto detect (recommended)", "RAW only", "ELA only", "Dual (RAW+ELA)"])
-
-with col2:
-    preproc_choice = st.selectbox("Preprocessing",
-        ["Auto (EfficientNet if available)", "Normalize 0..1"])
-
-ela_quality = st.slider("ELA JPEG Quality", 50, 99, 91,
-    help="Must match the quality used during training (default: 91).")
-
-uploaded_image = st.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
-
-# Load threshold early so user can see/adjust it before clicking Run
-_threshold_json = load_threshold(threshold_file, threshold_path)
-_default_threshold = _threshold_json if _threshold_json is not None else 0.5
-threshold = st.slider("Decision Threshold", 0.0, 1.0, float(_default_threshold),
-                       help="Lower = more sensitive to tampering. Higher = fewer false positives.")
-
-col_btn = st.columns([1, 2, 1])
-with col_btn[1]:
-    run = st.button("🚀 Run Prediction")
-
-
-# ---------------- MAIN LOGIC ----------------
-if run:
-    if not uploaded_image:
-        st.error("Upload an image first.")
-        st.stop()
-
-    # Load model — validate path is a real file to prevent arbitrary path access
-    if model_file:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".keras")
-        try:
-            tmp.write(model_file.getvalue())
-            tmp.close()
-            model_path_to_load = tmp.name
-        except Exception as e:
-            st.error(f"Failed to save uploaded model: {e}")
-            st.stop()
-    else:
-        if not os.path.isfile(model_path):
-            st.error(f"Model file not found: `{model_path}`")
-            st.stop()
-        model_path_to_load = model_path
-
-    # Load model with error handling
-    try:
-        with st.spinner("Loading model..."):
-            model = load_model_cached(model_path_to_load)
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        # Clean up temp file if it was an upload
-        if model_file and os.path.exists(model_path_to_load):
-            os.unlink(model_path_to_load)
-        st.stop()
-
-    shapes = infer_input_shapes(model)
-    is_dual = len(shapes) >= 2
-
-    # Respect the user's input mode selection
-    if input_hint.startswith("Auto"):
-        input_mode = "dual" if is_dual else "raw"
-    elif "ELA" in input_hint and "RAW" in input_hint:
-        input_mode = "dual"
-    elif "ELA" in input_hint:
-        input_mode = "ela"
-    else:
-        input_mode = "raw"
-
-    use_effnet = (preproc_choice.startswith("Auto") and ef_preprocess is not None)
-
-    # Open and preprocess image with error handling
-    try:
-        with st.spinner("Preprocessing image..."):
-            img = Image.open(uploaded_image).convert("RGB")
-    except Exception as e:
-        st.error(f"Failed to open image: {e}")
-        if model_file and os.path.exists(model_path_to_load):
-            os.unlink(model_path_to_load)
-        st.stop()
-
-    with st.spinner("Preprocessing image..."):
-        raw_arr = preprocess_pil(img, shapes[0], use_effnet)
-
-        # Only compute ELA if needed for model input or display
-        ela_img = compute_ela(img, quality=ela_quality, resize_to=shapes[0])
-        if input_mode in ("dual", "ela"):
-            ela_arr = preprocess_pil(ela_img, shapes[0], use_effnet)
-        else:
-            ela_arr = None
-
-        raw_batch = np.expand_dims(raw_arr, 0)
-
-        if input_mode == "dual" and ela_arr is not None:
-            ela_batch = np.expand_dims(ela_arr, 0)
-            inputs = [raw_batch, ela_batch]
-        elif input_mode == "ela" and ela_arr is not None:
-            inputs = np.expand_dims(ela_arr, 0)
-        else:
-            inputs = raw_batch
-
-    with st.spinner("Running inference..."):
-        preds = model(inputs, training=False)
-    prob_auth = extract_prob(preds)
-
-    label = "Authentic" if prob_auth >= threshold else "Tampered"
-
-    # Clean up temp file after inference is complete
-    if model_file and os.path.exists(model_path_to_load):
-        os.unlink(model_path_to_load)
-
-    # ---------------- RESULT UI ----------------
-    st.markdown("---")
-    st.subheader("📊 Prediction Result")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric("Prediction", label)
-        st.metric("Confidence", f"{max(prob_auth, 1 - prob_auth) * 100:.1f}%")
-
-    with col2:
-        st.metric("Authentic Prob", f"{prob_auth:.4f}")
-        st.metric("Tampered Prob", f"{1 - prob_auth:.4f}")
-
-    # Color-coded result bar
-    if label == "Authentic":
-        st.success(f"✅ Image classified as **{label}** (threshold: {threshold:.2f})")
-    else:
-        st.error(f"🚨 Image classified as **{label}** (threshold: {threshold:.2f})")
-
-    # ---------------- EXIF METADATA ----------------
-    exif = get_exif_tags(img)
-    if exif:
-        with st.expander("📋 EXIF Metadata (may reveal editing software)"):
-            for k, v in exif.items():
-                st.text(f"{k}: {v}")
-
-    # ---------------- HEATMAP OVERLAY ----------------
-    overlay = generate_heatmap_overlay(img, ela_img)
-
-    # ---------------- IMAGE DISPLAY ----------------
-    st.subheader("🖼 Image Analysis")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.image(img, caption="Original", use_container_width=True)
-
-    with col2:
-        st.image(ela_img, caption="ELA", use_container_width=True)
-
-    with col3:
-        st.image(overlay, caption="Heatmap Overlay", use_container_width=True)
-
-    # ---------------- DOWNLOAD ----------------
-    st.subheader("⬇️ Download Results")
-
-    buf_out = BytesIO()
-    overlay.save(buf_out, format="PNG")
-    st.download_button(
-        label="Download Heatmap Overlay",
-        data=buf_out.getvalue(),
-        file_name="heatmap_overlay.png",
-        mime="image/png",
+    model = tf.keras.models.load_model(
+        MODEL_PATH, 
+        custom_objects={'CrossAttentionFusion': CrossAttentionFusion, 'OHEMFocalLoss': OHEMFocalLoss},
+        compile=False
     )
+    print("Model loaded successfully!")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    model = None
+
+def compute_ela_and_raw(img, target_size=(224, 224)):
+    img = img.convert('RGB')
+    channels = []
+    for q in [75, 85, 95]:
+        buf = io.BytesIO()
+        img.save(buf, 'JPEG', quality=q)
+        buf.seek(0)
+        compressed = Image.open(buf)
+        ela = ImageChops.difference(img, compressed).convert('L')
+        extrema = ela.getextrema()
+        if extrema[1] != 0:
+            scale = 255.0 / extrema[1]
+            ela = ela.point(lambda p: p * scale)
+        channels.append(ela)
+        
+    mq_ela = Image.merge('RGB', channels)
+    mq_ela_resized = mq_ela.resize(target_size, Image.LANCZOS)
+    raw_resized = img.resize(target_size, Image.LANCZOS)
+    
+    # Preprocess
+    raw_arr = np.array(raw_resized)
+    ela_arr = np.array(mq_ela_resized)
+    
+    raw_arr = tf.keras.applications.densenet.preprocess_input(tf.cast(raw_arr, tf.float32))
+    ela_arr = tf.keras.applications.densenet.preprocess_input(tf.cast(ela_arr, tf.float32))
+    
+    # Return flat arrays for stacking
+    return raw_arr, ela_arr, mq_ela_resized
+
+@app.post("/predict")
+async def predict_images(files: List[UploadFile] = File(...)):
+    if model is None:
+        return JSONResponse(status_code=500, content={"error": "Model not loaded."})
+        
+    if len(files) > 10:
+        return JSONResponse(status_code=400, content={"error": "Maximum 10 images allowed per batch."})
+        
+    try:
+        raw_batch = []
+        ela_batch = []
+        meta_data = []
+        
+        for file in files:
+            contents = await file.read()
+            img = Image.open(io.BytesIO(contents))
+            
+            # Prepare inputs
+            raw_arr, ela_arr, mq_ela_img = compute_ela_and_raw(img)
+            raw_batch.append(raw_arr)
+            ela_batch.append(ela_arr)
+            
+            # Encode ELA image to base64 for frontend display
+            buffered = io.BytesIO()
+            mq_ela_img.save(buffered, format="JPEG")
+            ela_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            
+            # Encode original image
+            orig_buffered = io.BytesIO()
+            img.copy().convert("RGB").save(orig_buffered, format="JPEG")
+            orig_b64 = base64.b64encode(orig_buffered.getvalue()).decode("utf-8")
+            
+            meta_data.append({
+                "ela_image": f"data:image/jpeg;base64,{ela_b64}",
+                "original_image": f"data:image/jpeg;base64,{orig_b64}"
+            })
+            
+        # Stack into batch tensors
+        raw_tensor = np.stack(raw_batch)
+        ela_tensor = np.stack(ela_batch)
+        
+        # Predict all at once!
+        preds = model.predict({'raw_input': raw_tensor, 'ela_input': ela_tensor})
+        
+        results = []
+        for i, pred in enumerate(preds):
+            score = float(pred[0])
+            is_authentic = bool(score > 0.5)
+            confidence = score if is_authentic else (1 - score)
+            
+            results.append({
+                "is_authentic": is_authentic,
+                "confidence": f"{confidence * 100:.2f}%",
+                "score": score,
+                "ela_image": meta_data[i]["ela_image"],
+                "original_image": meta_data[i]["original_image"]
+            })
+            
+        return results
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
